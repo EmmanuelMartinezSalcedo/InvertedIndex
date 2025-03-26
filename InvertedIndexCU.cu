@@ -1,94 +1,196 @@
+#include <cuda_runtime.h>
 #include <iostream>
 #include <fstream>
 #include <vector>
-#include <unordered_map>
 #include <unordered_set>
 #include <string>
-#include <sstream>
 #include <filesystem>
-#include <cuda_runtime.h>
+#include <chrono>
 
 using namespace std;
 namespace fs = std::filesystem;
 
-#define MAX_WORD_LENGTH 32
-#define MAX_WORDS 1000000
+#define MAX_WORD_LENGTH 50
+#define CHUNK_SIZE (1024 * 1024 * 32)  // 32MB chunks
+#define NUM_STREAMS 38
 
-__global__ void processWords(char *words, int *fileIds, int wordCount, char *uniqueWords, int *wordPresence, int uniqueWordCount, int fileId) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < wordCount) {
-        char word[MAX_WORD_LENGTH];
-        strncpy(word, &words[idx * MAX_WORD_LENGTH], MAX_WORD_LENGTH);
-        word[MAX_WORD_LENGTH - 1] = '\0';
-        
-        for (int i = 0; i < uniqueWordCount; i++) {
-            if (strncmp(word, &uniqueWords[i * MAX_WORD_LENGTH], MAX_WORD_LENGTH) == 0) {
-                atomicExch(&wordPresence[i * MAX_WORDS + fileId], 1);
-            }
-        }
+__device__ bool d_isspace(char c) {
+  return c == ' ' || c == '\n' || c == '\r' || c == '\t';
+}
+
+__device__ char d_tolower(char c) {
+  return (c >= 'A' && c <= 'Z') ? c + ('a' - 'A') : c;
+}
+
+__device__ int d_strlen(const char *str) {
+  int len = 0;
+  while (str[len] != '\0') len++;
+  return len;
+}
+
+__device__ bool d_strncmp(const char *s1, const char *s2, int n) {
+  for (int i = 0; i < n; i++) {
+    if (s1[i] != s2[i]) return false;
+    if (s1[i] == '\0') return true;
+  }
+  return true;
+}
+
+__global__ void processChunkKernel(char *chunk, size_t chunkSize, char *words, int *wordCount, bool isFirstChunk) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= chunkSize) return;
+
+  __shared__ char sharedChunk[1024];
+  __shared__ bool isWordStart[1024];
+
+  if (threadIdx.x < 1024 && idx < chunkSize) {
+      sharedChunk[threadIdx.x] = chunk[idx];
+      isWordStart[threadIdx.x] = (idx == 0) || d_isspace(chunk[idx - 1]);
+  }
+  __syncthreads();
+
+  if (!isFirstChunk && idx == 0) return;
+
+  if (isWordStart[threadIdx.x] && !d_isspace(sharedChunk[threadIdx.x])) {
+    char word[MAX_WORD_LENGTH];
+    int length = 0;
+
+    while (idx + length < chunkSize && length < MAX_WORD_LENGTH - 1 && !d_isspace(chunk[idx + length])) {
+      word[length] = d_tolower(chunk[idx + length]);
+      length++;
     }
+
+    if (idx + length >= chunkSize) return;
+
+    word[length] = '\0';
+
+    if (length > 3) {
+      const char *suffixes[] = {"ing", "ed", "ly", "ful", "est", "ity", "es", "s"};
+      for (const char *suffix : suffixes) {
+        int suffixLen = d_strlen(suffix);
+        if (length > suffixLen + 1 && 
+          d_strncmp(&word[length - suffixLen], suffix, suffixLen)) {
+          length -= suffixLen;
+          word[length] = '\0';
+          break;
+        }
+      }
+    }
+
+    if (length > 0) {
+      int wordIdx = atomicAdd(wordCount, 1);
+      memcpy(&words[wordIdx * MAX_WORD_LENGTH], word, length + 1);
+    }
+  }
+}
+
+void processFile(const string& filename, unordered_set<string>& uniqueWords) {
+  cudaStream_t streams[NUM_STREAMS];
+  for (int i = 0; i < NUM_STREAMS; i++) {
+      cudaStreamCreate(&streams[i]);
+  }
+
+  ifstream file(filename, ios::binary);
+  file.seekg(0, ios::end);
+  size_t fileSize = file.tellg();
+  file.seekg(0, ios::beg);
+
+  char *h_chunk, *d_chunk;
+  char *d_words;
+  int *d_wordCount;
+
+  cudaMallocHost(&h_chunk, CHUNK_SIZE);
+  cudaMalloc(&d_chunk, CHUNK_SIZE);
+  cudaMalloc(&d_words, CHUNK_SIZE * MAX_WORD_LENGTH);
+  cudaMalloc(&d_wordCount, sizeof(int));
+
+  int currentStream = 0;
+  unordered_set<string> fileWords;
+
+  for (size_t offset = 0; offset < fileSize; offset += CHUNK_SIZE) {
+  size_t currentChunkSize = std::min(static_cast<size_t>(CHUNK_SIZE), fileSize - offset);
+  file.read(h_chunk, currentChunkSize);
+
+  cudaMemsetAsync(d_wordCount, 0, sizeof(int), streams[currentStream]);
+  cudaMemcpyAsync(d_chunk, h_chunk, currentChunkSize, cudaMemcpyHostToDevice, streams[currentStream]);
+
+    int blockSize = 256;
+    int numBlocks = (currentChunkSize + blockSize - 1) / blockSize;
+
+    processChunkKernel<<<numBlocks, blockSize, 0, streams[currentStream]>>>(d_chunk, currentChunkSize, d_words, d_wordCount, offset == 0);
+
+    int h_wordCount;
+    cudaMemcpyAsync(&h_wordCount, d_wordCount, sizeof(int), cudaMemcpyDeviceToHost, streams[currentStream]);
+
+    cudaStreamSynchronize(streams[currentStream]);
+
+    if (h_wordCount > 0) {
+      char *h_words = new char[h_wordCount * MAX_WORD_LENGTH];
+      cudaMemcpy(h_words, d_words, h_wordCount * MAX_WORD_LENGTH, cudaMemcpyDeviceToHost);
+
+      for (int i = 0; i < h_wordCount; i++) {
+        string word(&h_words[i * MAX_WORD_LENGTH]);
+        if (fileWords.insert(word).second) {
+          uniqueWords.insert(word);
+        }
+      }
+
+      delete[] h_words;
+    }
+
+    currentStream = (currentStream + 1) % NUM_STREAMS;
+    float progress = (float)offset / fileSize * 100;
+    cout << "\rProcessing " << fs::path(filename).filename().string() << ": " << progress << "%" << flush;
+  }
+  cout << endl;
+
+  cudaFreeHost(h_chunk);
+  cudaFree(d_chunk);
+  cudaFree(d_words);
+  cudaFree(d_wordCount);
+
+  for (int i = 0; i < NUM_STREAMS; i++) {
+    cudaStreamDestroy(streams[i]);
+  }
 }
 
 int main() {
-    vector<string> files;
-    for (const auto &entry : fs::directory_iterator(".")) {
-        if (entry.path().extension() == ".txt") {
-            files.push_back(entry.path().string());
-        }
-    }
-    
-    unordered_set<string> uniqueWordsSet;
-    vector<vector<string>> fileWords(files.size());
-    
-    for (size_t i = 0; i < files.size(); i++) {
-        ifstream file(files[i]);
-        string word;
-        while (file >> word) {
-            uniqueWordsSet.insert(word);
-            fileWords[i].push_back(word);
-        }
-    }
-    
-    vector<string> uniqueWords(uniqueWordsSet.begin(), uniqueWordsSet.end());
-    int wordCount = uniqueWords.size();
-    int totalWords = 0;
-    for (const auto &fw : fileWords) totalWords += fw.size();
+  auto start_time = chrono::high_resolution_clock::now();
 
-    char *d_words, *d_uniqueWords;
-    int *d_fileIds, *d_wordPresence;
-    
-    cudaMalloc((void**)&d_words, totalWords * MAX_WORD_LENGTH * sizeof(char));
-    cudaMalloc((void**)&d_uniqueWords, wordCount * MAX_WORD_LENGTH * sizeof(char));
-    cudaMalloc((void**)&d_fileIds, totalWords * sizeof(int));
-    cudaMalloc((void**)&d_wordPresence, wordCount * files.size() * sizeof(int));
-    
-    cudaMemcpy(d_uniqueWords, uniqueWords.data(), wordCount * MAX_WORD_LENGTH * sizeof(char), cudaMemcpyHostToDevice);
-    
-    int offset = 0;
+  vector<string> files;
+  for (const auto &entry : fs::directory_iterator("GeneratedFiles")) {
+    if (entry.path().extension() == ".txt") {
+      files.push_back(entry.path().string());
+    }
+  }
+
+  if (files.empty()) {
+    cout << "No .txt files found in GeneratedFiles directory!" << endl;
+    return 1;
+  }
+
+  unordered_set<string> globalUniqueWords;
+  vector<unordered_set<string>> fileUniqueWords(files.size());
+
+  for (size_t i = 0; i < files.size(); i++) {
+    processFile(files[i], fileUniqueWords[i]);
+    globalUniqueWords.insert(fileUniqueWords[i].begin(), fileUniqueWords[i].end());
+  }
+
+  cout << "\nGenerating Inverted Index...\n";
+  for (const auto& word : globalUniqueWords) {
+    cout << word << " -> ";
     for (size_t i = 0; i < files.size(); i++) {
-        cudaMemcpy(d_words + offset * MAX_WORD_LENGTH, fileWords[i].data(), fileWords[i].size() * MAX_WORD_LENGTH * sizeof(char), cudaMemcpyHostToDevice);
-        processWords<<<(fileWords[i].size() + 255) / 256, 256>>>(d_words, d_fileIds, fileWords[i].size(), d_uniqueWords, d_wordPresence, wordCount, i);
-        offset += fileWords[i].size();
+      if (fileUniqueWords[i].find(word) != fileUniqueWords[i].end()) {
+        cout << fs::path(files[i]).filename().string() << " ";
+      }
     }
-    
-    vector<int> wordPresence(wordCount * files.size());
-    cudaMemcpy(wordPresence.data(), d_wordPresence, wordCount * files.size() * sizeof(int), cudaMemcpyDeviceToHost);
-    
-    cudaFree(d_words);
-    cudaFree(d_uniqueWords);
-    cudaFree(d_fileIds);
-    cudaFree(d_wordPresence);
-    
-    cout << "\nInverted Index:\n";
-    for (size_t i = 0; i < uniqueWords.size(); i++) {
-        cout << uniqueWords[i] << " -> ";
-        for (size_t j = 0; j < files.size(); j++) {
-            if (wordPresence[i * files.size() + j]) {
-                cout << files[j] << " ";
-            }
-        }
-        cout << "\n";
-    }
-    
-    return 0;
+    cout << "\n";
+  }
+
+  auto end_time = chrono::high_resolution_clock::now();
+  float total_time = chrono::duration<float>(end_time - start_time).count();
+  cout << "\nTotal processing time: " << total_time << " seconds\n";
+
+  return 0;
 }
