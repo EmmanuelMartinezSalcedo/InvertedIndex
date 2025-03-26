@@ -194,3 +194,6 @@ int main() {
 
   return 0;
 }
+
+// Compile: nvcc -O3 -arch=sm_89 -std=c++17 InvertedIndexCU.cu -o InvertedIndexCU.exe
+// Run:     InvertedIndexCU.exe
