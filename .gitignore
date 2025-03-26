@@ -1,0 +1,7 @@
+GeneratedFiles/
+.vscode/
+MultipleFilesGenerator.exe
+MultipleFilesGenerator.obj
+InvertedIndexCU.exe
+InvertedIndexCU.exp
+InvertedIndexCU.lib
